@@ -352,6 +352,26 @@ func NewPointFrom(pt models.Point) *Point {
 	return &Point{pt: pt}
 }
 
+// Error gives access to the status code of the HTTP request to the InfluxDB server
+type Error interface {
+	error
+	StatusCode() int // the underlying HTTP statuscode
+}
+
+type requestError struct {
+	msg        error
+	statusCode int
+}
+
+func (r *requestError) Error() string {
+	return r.msg.Error()
+}
+
+// StatusCode returns the HTTP status code of the response from InfluxDB
+func (r *requestError) StatusCode() int {
+	return r.statusCode
+}
+
 func (c *client) Write(bp BatchPoints) error {
 	var b bytes.Buffer
 
@@ -396,10 +416,11 @@ func (c *client) Write(bp BatchPoints) error {
 	}
 
 	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
-		var err = fmt.Errorf(string(body))
-		return err
+		return &requestError{
+			msg:        fmt.Errorf(string(body)),
+			statusCode: resp.StatusCode,
+		}
 	}
-
 	return nil
 }
 
