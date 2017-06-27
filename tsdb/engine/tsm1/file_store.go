@@ -246,47 +246,6 @@ func (f *FileStore) NextGeneration() int {
 	return f.currentGeneration
 }
 
-// Add adds the given files to the file store's list of files.
-func (f *FileStore) Add(files ...TSMFile) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	for _, file := range files {
-		atomic.AddInt64(&f.stats.DiskBytes, int64(file.Size()))
-	}
-	f.lastFileStats = nil
-	f.files = append(f.files, files...)
-	sort.Sort(tsmReaders(f.files))
-	atomic.StoreInt64(&f.stats.FileCount, int64(len(f.files)))
-}
-
-// Remove removes the files with matching paths from the set of active files.  It does
-// not remove the paths from disk.
-func (f *FileStore) Remove(paths ...string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	var active []TSMFile
-	for _, file := range f.files {
-		keep := true
-		for _, remove := range paths {
-			if remove == file.Path() {
-				keep = false
-				break
-			}
-		}
-
-		if keep {
-			active = append(active, file)
-		} else {
-			// Removing the file, remove the file size from the total file store bytes
-			atomic.AddInt64(&f.stats.DiskBytes, -int64(file.Size()))
-		}
-	}
-	f.lastFileStats = nil
-	f.files = active
-	sort.Sort(tsmReaders(f.files))
-	atomic.StoreInt64(&f.stats.FileCount, int64(len(f.files)))
-}
-
 // WalkKeys calls fn for every key in every TSM file known to the FileStore.  If the key
 // exists in multiple files, it will be invoked for each file.
 func (f *FileStore) WalkKeys(fn func(key []byte, typ byte) error) error {
@@ -358,13 +317,17 @@ func (f *FileStore) Delete(keys []string) error {
 
 // DeleteRange removes the values for keys between timestamps min and max.
 func (f *FileStore) DeleteRange(keys []string, min, max int64) error {
+	if err := f.walkFiles(func(tsm TSMFile) error {
+		return tsm.DeleteRange(keys, min, max)
+	}); err != nil {
+		return err
+	}
+
 	f.mu.Lock()
 	f.lastModified = time.Now().UTC()
+	f.lastFileStats = nil
 	f.mu.Unlock()
-
-	return f.walkFiles(func(tsm TSMFile) error {
-		return tsm.DeleteRange(keys, min, max)
-	})
+	return nil
 }
 
 // Open loads all the TSM files in the configured directory.
@@ -423,15 +386,6 @@ func (f *FileStore) Open() error {
 			return fmt.Errorf("error opening file %s: %v", fn, err)
 		}
 
-		// Accumulate file store size stat
-		fi, err := file.Stat()
-		if err == nil {
-			atomic.AddInt64(&f.stats.DiskBytes, fi.Size())
-			if fi.ModTime().UTC().After(f.lastModified) {
-				f.lastModified = fi.ModTime().UTC()
-			}
-		}
-
 		go func(idx int, file *os.File) {
 			start := time.Now()
 			df, err := NewTSMReader(file)
@@ -445,6 +399,7 @@ func (f *FileStore) Open() error {
 		}(i, file)
 	}
 
+	var lm int64
 	for range files {
 		res := <-readerC
 		if res.err != nil {
@@ -452,7 +407,19 @@ func (f *FileStore) Open() error {
 			return res.err
 		}
 		f.files = append(f.files, res.r)
+		// Accumulate file store size stats
+		atomic.AddInt64(&f.stats.DiskBytes, int64(res.r.Size()))
+		for _, ts := range res.r.TombstoneFiles() {
+			atomic.AddInt64(&f.stats.DiskBytes, int64(ts.Size))
+		}
+
+		// Re-initialize the lastModified time for the file store
+		if res.r.LastModified() > lm {
+			lm = res.r.LastModified()
+		}
+
 	}
+	f.lastModified = time.Unix(0, lm)
 	close(readerC)
 
 	sort.Sort(tsmReaders(f.files))
@@ -473,6 +440,10 @@ func (f *FileStore) Close() error {
 	f.files = nil
 	atomic.StoreInt64(&f.stats.FileCount, 0)
 	return nil
+}
+
+func (f *FileStore) DiskSizeBytes() int64 {
+	return atomic.LoadInt64(&f.stats.DiskBytes)
 }
 
 // Read returns the slice of values for the given key and the given timestamp,
@@ -664,6 +635,10 @@ func (f *FileStore) Replace(oldFiles, newFiles []string) error {
 	var totalSize int64
 	for _, file := range f.files {
 		totalSize += int64(file.Size())
+		for _, ts := range file.TombstoneFiles() {
+			totalSize += int64(ts.Size)
+		}
+
 	}
 	atomic.StoreInt64(&f.stats.DiskBytes, totalSize)
 

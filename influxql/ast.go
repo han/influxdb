@@ -1519,7 +1519,7 @@ func (s *SelectStatement) ColumnNames() []string {
 
 		switch f := field.Expr.(type) {
 		case *Call:
-			if f.Name == "top" || f.Name == "bottom" {
+			if s.Target == nil && (f.Name == "top" || f.Name == "bottom") {
 				for _, arg := range f.Args[1:] {
 					ref, ok := arg.(*VarRef)
 					if ok {
@@ -4101,7 +4101,7 @@ func TimeRange(expr Expr) (min, max time.Time, err error) {
 
 // TimeRangeAsEpochNano returns the minimum and maximum times, as epoch nano, specified by
 // an expression. If there is no lower bound, the minimum time is returned
-// for minimum. If there is no higher bound, now is returned for maximum.
+// for minimum. If there is no higher bound, the maximum time is returned.
 func TimeRangeAsEpochNano(expr Expr) (min, max int64, err error) {
 	tmin, tmax, err := TimeRange(expr)
 	if err != nil {
@@ -4114,7 +4114,7 @@ func TimeRangeAsEpochNano(expr Expr) (min, max int64, err error) {
 		min = tmin.UnixNano()
 	}
 	if tmax.IsZero() {
-		max = time.Now().UnixNano()
+		max = time.Unix(0, MaxTime).UnixNano()
 	} else {
 		max = tmax.UnixNano()
 	}
@@ -4300,7 +4300,15 @@ func Rewrite(r Rewriter, node Node) Node {
 		n.Fields = Rewrite(r, n.Fields).(Fields)
 		n.Dimensions = Rewrite(r, n.Dimensions).(Dimensions)
 		n.Sources = Rewrite(r, n.Sources).(Sources)
-		n.Condition = Rewrite(r, n.Condition).(Expr)
+
+		// Rewrite may return nil. Nil does not satisfy the Expr
+		// interface. We only assert the rewritten result to be an
+		// Expr if it is not nil:
+		if cond := Rewrite(r, n.Condition); cond != nil {
+			n.Condition = cond.(Expr)
+		} else {
+			n.Condition = nil
+		}
 
 	case *SubQuery:
 		n.Statement = Rewrite(r, n.Statement).(*SelectStatement)
