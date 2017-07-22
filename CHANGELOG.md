@@ -4,18 +4,34 @@
 
 #### `[collectd]` Section
 
-* `parse-multivalue-plugin` was added with a default of `split`.  When set to `split`, multivalue plugin data (e.g. df free:5000,used:1000) will be split into separate measurements (e.g., (df_free, value=5000) (df_used, value=1000)).  When set to `join`, multivalue plugin will be stored as a single multi-value measurement (e.g., (df, free=5000,used=1000)).  
+* `parse-multivalue-plugin` was added with a default of `split`.  When set to `split`, multivalue plugin data (e.g. df free:5000,used:1000) will be split into separate measurements (e.g., (df_free, value=5000) (df_used, value=1000)).  When set to `join`, multivalue plugin will be stored as a single multi-value measurement (e.g., (df, free=5000,used=1000)).
 
 ### Features
 
-- [#8426](https://github.com/influxdata/influxdb/issues/8426): Add `parse-multivalue-plugin` to allow users to choose how multivalue plugins should be handled by the collectd service.  
+- [#8574](https://github.com/influxdata/influxdb/pull/8574): Add 'X-Influxdb-Build' to http response headers so users can identify if a response is from an OSS or Enterprise service.
+- [#8426](https://github.com/influxdata/influxdb/issues/8426): Add `parse-multivalue-plugin` to allow users to choose how multivalue plugins should be handled by the collectd service.
+- [#8548](https://github.com/influxdata/influxdb/issues/8548): Allow panic recovery to be disabled when investigating server issues.
+- [#8525](https://github.com/influxdata/influxdb/issues/8525): Support http pipelining for /query endpoint.
 
 ### Bugfixes
 
 - [#8480](https://github.com/influxdata/influxdb/pull/8480): Change the default stats interval to 1 second instead of 10 seconds.
 - [#8466](https://github.com/influxdata/influxdb/issues/8466): illumos build broken on syscall.Mmap
+- [#8124](https://github.com/influxdata/influxdb/issues/8124): Prevent privileges on non-existent databases from being set.
+- [#8558](https://github.com/influxdata/influxdb/issues/8558): Dropping measurement used several GB disk space
+- [#8569](https://github.com/influxdata/influxdb/issues/8569): Fix the cq start and end times to use unix timestamps.
+- [#8601](https://github.com/influxdata/influxdb/pull/8601): Fixed time boundaries for continuous queries with time zones.
 
-## v1.3.0 [unreleased]
+## v1.3.1 [unreleased]
+
+### Bugfixes
+
+- [#8559](https://github.com/influxdata/influxdb/issues/8559): Ensure temporary TSM files get cleaned up when compaction aborted.
+- [#8500](https://github.com/influxdata/influxdb/issues/8500): InfluxDB goes unresponsive
+- [#8531](https://github.com/influxdata/influxdb/issues/8531): Duplicate points generated via INSERT after DELETE
+
+
+## v1.3.0 [2017-06-21]
 
 ### Release Notes
 
@@ -44,21 +60,22 @@ The admin UI is removed and unusable in this release. The `[admin]` configuratio
 
 * The top-level config `bind-address` now defaults to `localhost:8088`.
   The previous default was just `:8088`, causing the backup and restore port to be bound on all available interfaces (i.e. including interfaces on the public internet).
-  
+
 The following new configuration options are available.
 
 #### `[http]` Section
 
-* `max-body-size` was added with a default of 25,000,000, but can be disabled by setting it to 0. 
+* `max-body-size` was added with a default of 25,000,000, but can be disabled by setting it to 0.
   Specifies the maximum size (in bytes) of a client request body. When a client sends data that exceeds
-  the configured maximum size, a `413 Request Entity Too Large` HTTP response is returned. 
-  
+  the configured maximum size, a `413 Request Entity Too Large` HTTP response is returned.
+
 #### `[continuous_queries]` Section
 
 * `query-stats-enabled` was added with a default of `false`. When set to `true`, continuous query execution statistics are written to the default monitor store.
 
 ### Features
 
+- [#8512](https://github.com/influxdata/influxdb/pull/8512): Switch to LogLog-Beta Cardinality estimation 
 - [#8143](https://github.com/influxdata/influxdb/pull/8143): Add WAL sync delay
 - [#7977](https://github.com/influxdata/influxdb/issues/7977): Add chunked request processing back into the Go client v2
 - [#7974](https://github.com/influxdata/influxdb/pull/7974): Allow non-admin users to execute SHOW DATABASES.
@@ -131,7 +148,7 @@ The following new configuration options are available.
 - [#8455](https://github.com/influxdata/influxdb/pull/8455): Check file count before attempting a TSI level compaction.
 - [#8470](https://github.com/influxdata/influxdb/issues/8470): index file fd leak in tsi branch
 - [#8468](https://github.com/influxdata/influxdb/pull/8468): Fix TSI non-contiguous compaction panic.
-
+- [#8500](https://github.com/influxdata/influxdb/issues/8500): InfluxDB goes unresponsive
 ## v1.2.4 [2017-05-08]
 
 ### Bugfixes

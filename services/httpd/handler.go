@@ -68,8 +68,9 @@ type Route struct {
 
 // Handler represents an HTTP handler for the InfluxDB server.
 type Handler struct {
-	mux     *pat.PatternServeMux
-	Version string
+	mux       *pat.PatternServeMux
+	Version   string
+	BuildType string
 
 	MetaClient interface {
 		Database(name string) *meta.DatabaseInfo
@@ -180,6 +181,7 @@ type Statistics struct {
 	ActiveWriteRequests          int64
 	ClientErrors                 int64
 	ServerErrors                 int64
+	RecoveredPanics              int64
 }
 
 // Statistics returns statistics for periodic monitoring.
@@ -206,6 +208,7 @@ func (h *Handler) Statistics(tags map[string]string) []models.Statistic {
 			statWriteRequestsActive:          atomic.LoadInt64(&h.stats.ActiveWriteRequests),
 			statClientError:                  atomic.LoadInt64(&h.stats.ClientErrors),
 			statServerError:                  atomic.LoadInt64(&h.stats.ServerErrors),
+			statRecoveredPanics:              atomic.LoadInt64(&h.stats.RecoveredPanics),
 		},
 	}}
 }
@@ -247,8 +250,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer atomic.AddInt64(&h.stats.ActiveRequests, -1)
 	start := time.Now()
 
-	// Add version header to all InfluxDB requests.
+	// Add version and build header to all InfluxDB requests.
 	w.Header().Add("X-Influxdb-Version", h.Version)
+	w.Header().Add("X-Influxdb-Build", h.BuildType)
 
 	if strings.HasPrefix(r.URL.Path, "/debug/pprof") && h.Config.PprofEnabled {
 		h.handleProfiles(w, r)
@@ -426,7 +430,6 @@ func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user meta.U
 	}
 
 	// Execute query.
-	rw.Header().Add("Connection", "close")
 	results := h.QueryExecutor.ExecuteQuery(query, opts, closing)
 
 	// If we are running in async mode, open a goroutine to drain the results
@@ -1148,6 +1151,7 @@ func cors(inner http.Handler) http.Handler {
 			w.Header().Set(`Access-Control-Expose-Headers`, strings.Join([]string{
 				`Date`,
 				`X-InfluxDB-Version`,
+				`X-InfluxDB-Build`,
 			}, ", "))
 		}
 
@@ -1185,6 +1189,17 @@ func (h *Handler) responseWriter(inner http.Handler) http.Handler {
 	})
 }
 
+// if the env var is set, and the value is truthy, then we will *not*
+// recover from a panic.
+var willCrash bool
+
+func init() {
+	var err error
+	if willCrash, err = strconv.ParseBool(os.Getenv(influxql.PanicCrashEnv)); err != nil {
+		willCrash = false
+	}
+}
+
 func (h *Handler) recovery(inner http.Handler, name string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
@@ -1196,6 +1211,14 @@ func (h *Handler) recovery(inner http.Handler, name string) http.Handler {
 				logLine = fmt.Sprintf("%s [panic:%s] %s", logLine, err, debug.Stack())
 				h.CLFLogger.Println(logLine)
 				http.Error(w, http.StatusText(http.StatusInternalServerError), 500)
+				atomic.AddInt64(&h.stats.RecoveredPanics, 1) // Capture the panic in _internal stats.
+
+				if willCrash {
+					h.CLFLogger.Println("\n\n=====\nAll goroutines now follow:")
+					buf := debug.Stack()
+					h.CLFLogger.Printf("%s\n", buf)
+					os.Exit(1) // If we panic then the Go server will recover.
+				}
 			}
 		}()
 
