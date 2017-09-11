@@ -168,13 +168,13 @@ const (
 
 // storer is the interface that descibes a cache's store.
 type storer interface {
-	entry(key string) (*entry, bool)                // Get an entry by its key.
-	write(key string, values Values) error          // Write an entry to the store.
-	add(key string, entry *entry)                   // Add a new entry to the store.
-	remove(key string)                              // Remove an entry from the store.
-	keys(sorted bool) []string                      // Return an optionally sorted slice of entry keys.
-	apply(f func(string, *entry) error) error       // Apply f to all entries in the store in parallel.
-	applySerial(f func(string, *entry) error) error // Apply f to all entries in serial.
+	entry(key []byte) *entry                        // Get an entry by its key.
+	write(key []byte, values Values) error          // Write an entry to the store.
+	add(key []byte, entry *entry)                   // Add a new entry to the store.
+	remove(key []byte)                              // Remove an entry from the store.
+	keys(sorted bool) [][]byte                      // Return an optionally sorted slice of entry keys.
+	apply(f func([]byte, *entry) error) error       // Apply f to all entries in the store in parallel.
+	applySerial(f func([]byte, *entry) error) error // Apply f to all entries in serial.
 	reset()                                         // Reset the store to an initial unused state.
 }
 
@@ -201,18 +201,23 @@ type Cache struct {
 
 	stats        *CacheStatistics
 	lastSnapshot time.Time
+
+	// A one time synchronization used to initial the cache with a store.  Since the store can allocate a
+	// a large amount memory across shards, we lazily create it.
+	initialize       atomic.Value
+	initializedCount uint32
 }
 
 // NewCache returns an instance of a cache which will use a maximum of maxSize bytes of memory.
 // Only used for engine caches, never for snapshots.
 func NewCache(maxSize uint64, path string) *Cache {
-	store, _ := newring(ringShards)
 	c := &Cache{
 		maxSize:      maxSize,
-		store:        store, // Max size for now..
+		store:        emptyStore{},
 		stats:        &CacheStatistics{},
 		lastSnapshot: time.Now(),
 	}
+	c.initialize.Store(&sync.Once{})
 	c.UpdateAge()
 	c.UpdateCompactTime(0)
 	c.updateCachedBytes(0)
@@ -253,9 +258,33 @@ func (c *Cache) Statistics(tags map[string]string) []models.Statistic {
 	}}
 }
 
+// init initializes the cache and allocates the underlying store.  Once initialized,
+// the store re-used until Freed.
+func (c *Cache) init() {
+	if !atomic.CompareAndSwapUint32(&c.initializedCount, 0, 1) {
+		return
+	}
+
+	c.mu.Lock()
+	c.store, _ = newring(ringShards)
+	c.mu.Unlock()
+}
+
+// Free releases the underlying store and memory held by the Cache.
+func (c *Cache) Free() {
+	if !atomic.CompareAndSwapUint32(&c.initializedCount, 1, 0) {
+		return
+	}
+
+	c.mu.Lock()
+	c.store = emptyStore{}
+	c.mu.Unlock()
+}
+
 // Write writes the set of values for the key to the cache. This function is goroutine-safe.
 // It returns an error if the cache will exceed its max size by adding the new values.
-func (c *Cache) Write(key string, values []Value) error {
+func (c *Cache) Write(key []byte, values []Value) error {
+	c.init()
 	addedSize := uint64(Values(values).Size())
 
 	// Enough room in the cache?
@@ -286,6 +315,7 @@ func (c *Cache) Write(key string, values []Value) error {
 // values as possible.  If one key fails, the others can still succeed and an
 // error will be returned.
 func (c *Cache) WriteMulti(values map[string][]Value) error {
+	c.init()
 	var addedSize uint64
 	for _, v := range values {
 		addedSize += uint64(Values(v).Size())
@@ -307,7 +337,7 @@ func (c *Cache) WriteMulti(values map[string][]Value) error {
 	// We'll optimistially set size here, and then decrement it for write errors.
 	c.increaseSize(addedSize)
 	for k, v := range values {
-		if err := store.write(k, v); err != nil {
+		if err := store.write([]byte(k), v); err != nil {
 			// The write failed, hold onto the error and adjust the size delta.
 			werr = err
 			addedSize -= uint64(Values(v).Size())
@@ -332,6 +362,8 @@ func (c *Cache) WriteMulti(values map[string][]Value) error {
 // Snapshot takes a snapshot of the current cache, adds it to the slice of caches that
 // are being flushed, and resets the current cache with new values.
 func (c *Cache) Snapshot() (*Cache, error) {
+	c.init()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -388,12 +420,14 @@ func (c *Cache) Deduplicate() {
 
 	// Apply a function that simply calls deduplicate on each entry in the ring.
 	// apply cannot return an error in this invocation.
-	_ = store.apply(func(_ string, e *entry) error { e.deduplicate(); return nil })
+	_ = store.apply(func(_ []byte, e *entry) error { e.deduplicate(); return nil })
 }
 
 // ClearSnapshot removes the snapshot cache from the list of flushing caches and
 // adjusts the size.
 func (c *Cache) ClearSnapshot(success bool) {
+	c.init()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -436,7 +470,7 @@ func (c *Cache) MaxSize() uint64 {
 }
 
 // Keys returns a sorted slice of all keys under management by the cache.
-func (c *Cache) Keys() []string {
+func (c *Cache) Keys() [][]byte {
 	c.mu.RLock()
 	store := c.store
 	c.mu.RUnlock()
@@ -445,7 +479,7 @@ func (c *Cache) Keys() []string {
 
 // unsortedKeys returns a slice of all keys under management by the cache. The
 // keys are not sorted.
-func (c *Cache) unsortedKeys() []string {
+func (c *Cache) unsortedKeys() [][]byte {
 	c.mu.RLock()
 	store := c.store
 	c.mu.RUnlock()
@@ -453,17 +487,17 @@ func (c *Cache) unsortedKeys() []string {
 }
 
 // Values returns a copy of all values, deduped and sorted, for the given key.
-func (c *Cache) Values(key string) Values {
+func (c *Cache) Values(key []byte) Values {
 	var snapshotEntries *entry
 
 	c.mu.RLock()
-	e, ok := c.store.entry(key)
+	e := c.store.entry(key)
 	if c.snapshot != nil {
-		snapshotEntries, _ = c.snapshot.store.entry(key)
+		snapshotEntries = c.snapshot.store.entry(key)
 	}
 	c.mu.RUnlock()
 
-	if !ok {
+	if e == nil {
 		if snapshotEntries == nil {
 			// No values in hot cache or snapshots.
 			return nil
@@ -510,7 +544,7 @@ func (c *Cache) Values(key string) Values {
 }
 
 // Delete removes all values for the given keys from the cache.
-func (c *Cache) Delete(keys []string) {
+func (c *Cache) Delete(keys [][]byte) {
 	c.DeleteRange(keys, math.MinInt64, math.MaxInt64)
 }
 
@@ -518,14 +552,16 @@ func (c *Cache) Delete(keys []string) {
 // with timestamps between between min and max from the cache.
 //
 // TODO(edd): Lock usage could possibly be optimised if necessary.
-func (c *Cache) DeleteRange(keys []string, min, max int64) {
+func (c *Cache) DeleteRange(keys [][]byte, min, max int64) {
+	c.init()
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	for _, k := range keys {
 		// Make sure key exist in the cache, skip if it does not
-		e, ok := c.store.entry(k)
-		if !ok {
+		e := c.store.entry(k)
+		if e == nil {
 			continue
 		}
 
@@ -558,8 +594,8 @@ func (c *Cache) SetMaxSize(size uint64) {
 // values returns the values for the key. It assumes the data is already sorted.
 // It doesn't lock the cache but it does read-lock the entry if there is one for the key.
 // values should only be used in compact.go in the CacheKeyIterator.
-func (c *Cache) values(key string) Values {
-	e, _ := c.store.entry(key)
+func (c *Cache) values(key []byte) Values {
+	e := c.store.entry(key)
 	if e == nil {
 		return nil
 	}
@@ -572,7 +608,7 @@ func (c *Cache) values(key string) Values {
 // ApplyEntryFn applies the function f to each entry in the Cache.
 // ApplyEntryFn calls f on each entry in turn, within the same goroutine.
 // It is safe for use by multiple goroutines.
-func (c *Cache) ApplyEntryFn(f func(key string, entry *entry) error) error {
+func (c *Cache) ApplyEntryFn(f func(key []byte, entry *entry) error) error {
 	c.mu.RLock()
 	store := c.store
 	c.mu.RUnlock()
@@ -601,12 +637,15 @@ func NewCacheLoader(files []string) *CacheLoader {
 // file is truncated up to and including the last valid byte, and processing
 // continues with the next segment file.
 func (cl *CacheLoader) Load(cache *Cache) error {
+
+	var r *WALSegmentReader
 	for _, fn := range cl.files {
 		if err := func() error {
 			f, err := os.OpenFile(fn, os.O_CREATE|os.O_RDWR, 0666)
 			if err != nil {
 				return err
 			}
+			defer f.Close()
 
 			// Log some information about the segments.
 			stat, err := os.Stat(f.Name())
@@ -615,8 +654,17 @@ func (cl *CacheLoader) Load(cache *Cache) error {
 			}
 			cl.Logger.Info(fmt.Sprintf("reading file %s, size %d", f.Name(), stat.Size()))
 
-			r := NewWALSegmentReader(f)
-			defer r.Close()
+			// Nothing to read, skip it
+			if stat.Size() == 0 {
+				return nil
+			}
+
+			if r == nil {
+				r = NewWALSegmentReader(f)
+				defer r.Close()
+			} else {
+				r.Reset(f)
+			}
 
 			for r.Next() {
 				entry, err := r.Read()
@@ -641,7 +689,7 @@ func (cl *CacheLoader) Load(cache *Cache) error {
 				}
 			}
 
-			return nil
+			return r.Close()
 		}(); err != nil {
 			return err
 		}
@@ -698,3 +746,14 @@ func (c *Cache) updateSnapshots() {
 	atomic.StoreInt64(&c.stats.DiskSizeBytes, int64(atomic.LoadUint64(&c.snapshotSize)))
 	atomic.StoreInt64(&c.stats.SnapshotCount, int64(c.snapshotAttempts))
 }
+
+type emptyStore struct{}
+
+func (e emptyStore) entry(key []byte) *entry                        { return nil }
+func (e emptyStore) write(key []byte, values Values) error          { return nil }
+func (e emptyStore) add(key []byte, entry *entry)                   {}
+func (e emptyStore) remove(key []byte)                              {}
+func (e emptyStore) keys(sorted bool) [][]byte                      { return nil }
+func (e emptyStore) apply(f func([]byte, *entry) error) error       { return nil }
+func (e emptyStore) applySerial(f func([]byte, *entry) error) error { return nil }
+func (e emptyStore) reset()                                         {}
