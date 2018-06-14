@@ -13,19 +13,14 @@ import (
 	"bytes"
 	"fmt"
 	"math"
+	"math/bits"
 
-	"github.com/dgryski/go-bits"
 	"github.com/dgryski/go-bitstream"
 )
 
-const (
-	// floatUncompressed is an uncompressed format using 8 bytes per value.
-	// Not yet implemented.
-	floatUncompressed = 0
-
-	// floatCompressedGorilla is a compressed format using the gorilla paper encoding
-	floatCompressedGorilla = 1
-)
+// Note: an uncompressed format is not yet implemented.
+// floatCompressedGorilla is a compressed format using the gorilla paper encoding
+const floatCompressedGorilla = 1
 
 // uvnan is the constant returned from math.NaN().
 const uvnan = 0x7FF8000000000001
@@ -110,8 +105,8 @@ func (s *FloatEncoder) Write(v float64) {
 	} else {
 		s.bw.WriteBit(bitstream.One)
 
-		leading := bits.Clz(vDelta)
-		trailing := bits.Ctz(vDelta)
+		leading := uint64(bits.LeadingZeros64(vDelta))
+		trailing := uint64(bits.TrailingZeros64(vDelta))
 
 		// Clamp number of leading zeros to avoid overflow when encoding
 		leading &= 0x1F

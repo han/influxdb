@@ -49,7 +49,7 @@ VENDOR = "InfluxData"
 DESCRIPTION = "Distributed time-series database."
 
 prereqs = [ 'git', 'go' ]
-go_vet_command = "go tool vet ./"
+go_vet_command = "go vet ./..."
 optional_prereqs = [ 'fpm', 'rpmbuild', 'gpg' ]
 
 fpm_common_args = "-f -s dir --log error \
@@ -162,13 +162,13 @@ def go_get(branch, update=False, no_uncommitted=False):
     if local_changes() and no_uncommitted:
         logging.error("There are uncommitted changes in the current directory.")
         return False
-    if not check_path_for("gdm"):
-        logging.info("Downloading `gdm`...")
-        get_command = "go get github.com/sparrc/gdm"
+    if not check_path_for("dep"):
+        logging.info("Downloading `dep`...")
+        get_command = "go get github.com/golang/dep/cmd/dep"
         run(get_command)
-    logging.info("Retrieving dependencies with `gdm`...")
+    logging.info("Retrieving dependencies with `dep`...")
     sys.stdout.flush()
-    run("{}/bin/gdm restore -v".format(os.environ.get("GOPATH")))
+    run("{}/bin/dep ensure -v -vendor-only".format(os.environ.get("GOPATH")))
     return True
 
 def run_tests(race, parallel, timeout, no_vet, junit=False):
@@ -690,7 +690,7 @@ def package(build_output, pkg_name, version, nightly=False, iteration=1, static=
                                                             package_arch)
                         current_location = os.path.join(os.getcwd(), current_location)
                         if package_type == 'tar':
-                            tar_command = "cd {} && tar -cvzf {}.tar.gz ./*".format(package_build_root, name)
+                            tar_command = "cd {} && tar -cvzf {}.tar.gz --owner=root ./*".format(package_build_root, name)
                             run(tar_command, shell=True)
                             run("mv {}.tar.gz {}".format(os.path.join(package_build_root, name), current_location), shell=True)
                             outfile = os.path.join(current_location, name + ".tar.gz")
@@ -714,7 +714,7 @@ def package(build_output, pkg_name, version, nightly=False, iteration=1, static=
                             package_build_root,
                             current_location)
                         if package_type == "rpm":
-                            fpm_command += "--depends coreutils --rpm-posttrans {}".format(POSTINST_SCRIPT)
+                            fpm_command += "--depends coreutils --depends shadow-utils --rpm-posttrans {}".format(POSTINST_SCRIPT)
                         out = run(fpm_command, shell=True)
                         matches = re.search(':path=>"(.*)"', out)
                         outfile = None

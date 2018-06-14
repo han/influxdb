@@ -18,10 +18,11 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/bits"
 	"sort"
+	"unsafe"
 
 	"github.com/cespare/xxhash"
-	"github.com/dgryski/go-bits"
 	"github.com/influxdata/influxdb/pkg/estimator"
 )
 
@@ -101,6 +102,19 @@ func NewPlus(p uint8) (*Plus, error) {
 	return hll, nil
 }
 
+// Bytes estimates the memory footprint of this Plus, in bytes.
+func (h *Plus) Bytes() int {
+	var b int
+	b += len(h.tmpSet) * 4
+	b += cap(h.denseList)
+	if h.sparseList != nil {
+		b += int(unsafe.Sizeof(*h.sparseList))
+		b += cap(h.sparseList.b)
+	}
+	b += int(unsafe.Sizeof(*h))
+	return b
+}
+
 // NewDefaultPlus creates a new Plus with the default precision.
 func NewDefaultPlus() *Plus {
 	p, err := NewPlus(DefaultPrecision)
@@ -110,17 +124,8 @@ func NewDefaultPlus() *Plus {
 	return p
 }
 
-// MustNewPlus returns a new Plus with precision p. Panic on error.
-func MustNewPlus(p uint8) *Plus {
-	hll, err := NewPlus(p)
-	if err != nil {
-		panic(err)
-	}
-	return hll
-}
-
 // Clone returns a deep copy of h.
-func (h *Plus) Clone() *Plus {
+func (h *Plus) Clone() estimator.Sketch {
 	var hll = &Plus{
 		hash:       h.hash,
 		p:          h.p,
@@ -154,7 +159,7 @@ func (h *Plus) Add(v []byte) {
 		i := bextr(x, 64-h.p, h.p) // {x63,...,x64-p}
 		w := x<<h.p | 1<<(h.p-1)   // {x63-p,...,x0}
 
-		rho := uint8(bits.Clz(w)) + 1
+		rho := uint8(bits.LeadingZeros64(w)) + 1
 		if rho > h.denseList[i] {
 			h.denseList[i] = rho
 		}
@@ -163,6 +168,10 @@ func (h *Plus) Add(v []byte) {
 
 // Count returns a cardinality estimate.
 func (h *Plus) Count() uint64 {
+	if h == nil {
+		return 0 // Nothing to do.
+	}
+
 	if h.sparse {
 		h.mergeSparse()
 		return uint64(h.linearCount(h.mp, h.mp-uint32(h.sparseList.count)))
@@ -228,6 +237,10 @@ func (h *Plus) Merge(s estimator.Sketch) error {
 
 // MarshalBinary implements the encoding.BinaryMarshaler interface.
 func (h *Plus) MarshalBinary() (data []byte, err error) {
+	if h == nil {
+		return nil, nil
+	}
+
 	// Marshal a version marker.
 	data = append(data, version)
 
@@ -275,13 +288,16 @@ func (h *Plus) MarshalBinary() (data []byte, err error) {
 
 // UnmarshalBinary implements the encoding.BinaryUnmarshaler interface.
 func (h *Plus) UnmarshalBinary(data []byte) error {
+	if len(data) < 12 {
+		return fmt.Errorf("provided buffer %v too short for initializing HLL sketch", data)
+	}
+
 	// Unmarshal version. We may need this in the future if we make
 	// non-compatible changes.
 	_ = data[0]
 
 	// Unmarshal precision.
 	p := uint8(data[1])
-
 	newh, err := NewPlus(p)
 	if err != nil {
 		return err
@@ -382,7 +398,7 @@ func (h *Plus) toNormal() {
 func (h *Plus) encodeHash(x uint64) uint32 {
 	idx := uint32(bextr(x, 64-h.pp, h.pp))
 	if bextr(x, 64-h.pp, h.pp-h.p) == 0 {
-		zeros := bits.Clz((bextr(x, 0, 64-h.pp)<<h.pp)|(1<<h.pp-1)) + 1
+		zeros := bits.LeadingZeros64((bextr(x, 0, 64-h.pp)<<h.pp)|(1<<h.pp-1)) + 1
 		return idx<<7 | uint32(zeros<<1) | 1
 	}
 	return idx << 1
@@ -394,9 +410,7 @@ func (h *Plus) decodeHash(k uint32) (uint32, uint8) {
 	if k&1 == 1 {
 		r = uint8(bextr32(k, 1, 6)) + h.pp - h.p
 	} else {
-		// We can use the 64bit clz implementation and reduce the result
-		// by 32 to get a clz for a 32bit word.
-		r = uint8(bits.Clz(uint64(k<<(32-h.pp+h.p-1))) - 31) // -32 + 1
+		r = uint8(bits.LeadingZeros32(k<<(32-h.pp+h.p-1)) + 1)
 	}
 	return h.getIndex(k), r
 }

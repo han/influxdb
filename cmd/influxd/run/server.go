@@ -13,6 +13,7 @@ import (
 
 	"github.com/influxdata/influxdb"
 	"github.com/influxdata/influxdb/coordinator"
+	"github.com/influxdata/influxdb/logger"
 	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxdb/monitor"
 	"github.com/influxdata/influxdb/query"
@@ -30,10 +31,12 @@ import (
 	"github.com/influxdata/influxdb/tcp"
 	"github.com/influxdata/influxdb/tsdb"
 	client "github.com/influxdata/usage-client/v1"
-	"github.com/uber-go/zap"
+	"go.uber.org/zap"
 
-	// Initialize the engine & index packages
+	"github.com/influxdata/influxdb/services/storage"
+	// Initialize the engine package
 	_ "github.com/influxdata/influxdb/tsdb/engine"
+	// Initialize the index package
 	_ "github.com/influxdata/influxdb/tsdb/index"
 )
 
@@ -63,12 +66,12 @@ type Server struct {
 	BindAddress string
 	Listener    net.Listener
 
-	Logger zap.Logger
+	Logger *zap.Logger
 
 	MetaClient *meta.Client
 
 	TSDBStore     *tsdb.Store
-	QueryExecutor *query.QueryExecutor
+	QueryExecutor *query.Executor
 	PointsWriter  *coordinator.PointsWriter
 	Subscriber    *subscriber.Service
 
@@ -141,10 +144,7 @@ func NewServer(c *Config, buildInfo *BuildInfo) (*Server, error) {
 
 		BindAddress: bind,
 
-		Logger: zap.New(
-			zap.NewTextEncoder(),
-			zap.Output(os.Stderr),
-		),
+		Logger: logger.New(os.Stderr),
 
 		MetaClient: meta.NewClient(c.Meta),
 
@@ -179,11 +179,11 @@ func NewServer(c *Config, buildInfo *BuildInfo) (*Server, error) {
 	s.PointsWriter.TSDBStore = s.TSDBStore
 
 	// Initialize query executor.
-	s.QueryExecutor = query.NewQueryExecutor()
+	s.QueryExecutor = query.NewExecutor()
 	s.QueryExecutor.StatementExecutor = &coordinator.StatementExecutor{
 		MetaClient:  s.MetaClient,
 		TaskManager: s.QueryExecutor.TaskManager,
-		TSDBStore:   coordinator.LocalTSDBStore{Store: s.TSDBStore},
+		TSDBStore:   s.TSDBStore,
 		ShardMapper: &coordinator.LocalShardMapper{
 			MetaClient: s.MetaClient,
 			TSDBStore:  coordinator.LocalTSDBStore{Store: s.TSDBStore},
@@ -233,7 +233,7 @@ func (s *Server) appendSnapshotterService() {
 // SetLogOutput sets the logger used for all messages. It must not be called
 // after the Open method has been called.
 func (s *Server) SetLogOutput(w io.Writer) {
-	s.Logger = zap.New(zap.NewTextEncoder(), zap.Output(zap.AddSync(w)))
+	s.Logger = logger.New(w)
 }
 
 func (s *Server) appendMonitorService() {
@@ -263,6 +263,23 @@ func (s *Server) appendHTTPDService(c httpd.Config) {
 	srv.Handler.PointsWriter = s.PointsWriter
 	srv.Handler.Version = s.buildInfo.Version
 	srv.Handler.BuildType = "OSS"
+
+	// Wire up storage service for Prometheus endpoints.
+	storageStore := storage.NewStore()
+	storageStore.MetaClient = s.MetaClient
+	storageStore.TSDBStore = s.TSDBStore
+	srv.Handler.Store = storageStore
+
+	s.Services = append(s.Services, srv)
+}
+
+func (s *Server) appendStorageService(c storage.Config) {
+	if !c.Enabled {
+		return
+	}
+	srv := storage.NewService(c)
+	srv.MetaClient = s.MetaClient
+	srv.TSDBStore = s.TSDBStore
 
 	s.Services = append(s.Services, srv)
 }
@@ -311,11 +328,7 @@ func (s *Server) appendPrecreatorService(c precreator.Config) error {
 	if !c.Enabled {
 		return nil
 	}
-	srv, err := precreator.NewService(c)
-	if err != nil {
-		return err
-	}
-
+	srv := precreator.NewService(c)
 	srv.MetaClient = s.MetaClient
 	s.Services = append(s.Services, srv)
 	return nil
@@ -367,6 +380,7 @@ func (s *Server) Open() error {
 	s.appendSnapshotterService()
 	s.appendContinuousQueryService(s.config.ContinuousQuery)
 	s.appendHTTPDService(s.config.HTTPD)
+	s.appendStorageService(s.config.Storage)
 	s.appendRetentionPolicyService(s.config.Retention)
 	for _, i := range s.config.GraphiteInputs {
 		if err := s.appendGraphiteService(i); err != nil {
@@ -412,7 +426,7 @@ func (s *Server) Open() error {
 		return fmt.Errorf("open tsdb store: %s", err)
 	}
 
-	// Open the subcriber service
+	// Open the subscriber service
 	if err := s.Subscriber.Open(); err != nil {
 		return fmt.Errorf("open subscriber: %s", err)
 	}
@@ -550,7 +564,7 @@ func (s *Server) reportServer() {
 
 // Service represents a service attached to the server.
 type Service interface {
-	WithLogger(log zap.Logger)
+	WithLogger(log *zap.Logger)
 	Open() error
 	Close() error
 }

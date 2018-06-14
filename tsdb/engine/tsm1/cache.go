@@ -10,7 +10,8 @@ import (
 
 	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxdb/tsdb"
-	"github.com/uber-go/zap"
+	"github.com/influxdata/influxql"
+	"go.uber.org/zap"
 )
 
 // ringShards specifies the number of partitions that the hash ring used to
@@ -18,7 +19,7 @@ import (
 // testing, a value above the number of cores on the machine does not provide
 // any additional benefit. For now we'll set it to the number of cores on the
 // largest box we could imagine running influx.
-const ringShards = 4096
+const ringShards = 16
 
 var (
 	// ErrSnapshotInProgress is returned if a snapshot is attempted while one is already running.
@@ -38,26 +39,14 @@ type entry struct {
 
 	// The type of values stored. Read only so doesn't need to be protected by
 	// mu.
-	vtype int
+	vtype byte
 }
 
 // newEntryValues returns a new instance of entry with the given values.  If the
 // values are not valid, an error is returned.
-//
-// newEntryValues takes an optional hint to indicate the initial buffer size.
-// The hint is only respected if it's positive.
-func newEntryValues(values []Value, hint int) (*entry, error) {
-	// Ensure we start off with a reasonably sized values slice.
-	if hint < 32 {
-		hint = 32
-	}
-
+func newEntryValues(values []Value) (*entry, error) {
 	e := &entry{}
-	if len(values) > hint {
-		e.values = make(Values, 0, len(values))
-	} else {
-		e.values = make(Values, 0, hint)
-	}
+	e.values = make(Values, 0, len(values))
 	e.values = append(e.values, values...)
 
 	// No values, don't check types and ordering
@@ -86,22 +75,19 @@ func (e *entry) add(values []Value) error {
 	}
 
 	// Are any of the new values the wrong type?
-	for _, v := range values {
-		if e.vtype != valueType(v) {
-			return tsdb.ErrFieldTypeConflict
+	if e.vtype != 0 {
+		for _, v := range values {
+			if e.vtype != valueType(v) {
+				return tsdb.ErrFieldTypeConflict
+			}
 		}
 	}
 
 	// entry currently has no values, so add the new ones and we're done.
 	e.mu.Lock()
 	if len(e.values) == 0 {
-		// Ensure we start off with a reasonably sized values slice.
-		if len(values) < 32 {
-			e.values = make(Values, 0, 32)
-			e.values = append(e.values, values...)
-		} else {
-			e.values = values
-		}
+		e.values = values
+		e.vtype = valueType(values[0])
 		e.mu.Unlock()
 		return nil
 	}
@@ -118,7 +104,7 @@ func (e *entry) deduplicate() {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	if len(e.values) == 0 {
+	if len(e.values) <= 1 {
 		return
 	}
 	e.values = e.values.Deduplicate()
@@ -135,6 +121,9 @@ func (e *entry) count() int {
 // filter removes all values with timestamps between min and max inclusive.
 func (e *entry) filter(min, max int64) {
 	e.mu.Lock()
+	if len(e.values) > 1 {
+		e.values = e.values.Deduplicate()
+	}
 	e.values = e.values.Exclude(min, max)
 	e.mu.Unlock()
 }
@@ -145,6 +134,13 @@ func (e *entry) size() int {
 	sz := e.values.Size()
 	e.mu.RUnlock()
 	return sz
+}
+
+// InfluxQLType returns for the entry the data type of its values.
+func (e *entry) InfluxQLType() (influxql.DataType, error) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.values.InfluxQLType()
 }
 
 // Statistics gathered by the Cache.
@@ -169,13 +165,15 @@ const (
 // storer is the interface that descibes a cache's store.
 type storer interface {
 	entry(key []byte) *entry                        // Get an entry by its key.
-	write(key []byte, values Values) error          // Write an entry to the store.
+	write(key []byte, values Values) (bool, error)  // Write an entry to the store.
 	add(key []byte, entry *entry)                   // Add a new entry to the store.
 	remove(key []byte)                              // Remove an entry from the store.
 	keys(sorted bool) [][]byte                      // Return an optionally sorted slice of entry keys.
 	apply(f func([]byte, *entry) error) error       // Apply f to all entries in the store in parallel.
 	applySerial(f func([]byte, *entry) error) error // Apply f to all entries in serial.
 	reset()                                         // Reset the store to an initial unused state.
+	split(n int) []storer                           // Split splits the store into n stores
+	count() int                                     // Count returns the number of keys in the store
 }
 
 // Cache maintains an in-memory store of Values for a set of keys.
@@ -199,8 +197,9 @@ type Cache struct {
 	// This number is the number of pending or failed WriteSnaphot attempts since the last successful one.
 	snapshotAttempts int
 
-	stats        *CacheStatistics
-	lastSnapshot time.Time
+	stats         *CacheStatistics
+	lastSnapshot  time.Time
+	lastWriteTime time.Time
 
 	// A one time synchronization used to initial the cache with a store.  Since the store can allocate a
 	// a large amount memory across shards, we lazily create it.
@@ -210,7 +209,7 @@ type Cache struct {
 
 // NewCache returns an instance of a cache which will use a maximum of maxSize bytes of memory.
 // Only used for engine caches, never for snapshots.
-func NewCache(maxSize uint64, path string) *Cache {
+func NewCache(maxSize uint64) *Cache {
 	c := &Cache{
 		maxSize:      maxSize,
 		store:        emptyStore{},
@@ -296,11 +295,15 @@ func (c *Cache) Write(key []byte, values []Value) error {
 		return ErrCacheMemorySizeLimitExceeded(n, limit)
 	}
 
-	if err := c.store.write(key, values); err != nil {
+	newKey, err := c.store.write(key, values)
+	if err != nil {
 		atomic.AddInt64(&c.stats.WriteErr, 1)
 		return err
 	}
 
+	if newKey {
+		addedSize += uint64(len(key))
+	}
 	// Update the cache size and the memory size stat.
 	c.increaseSize(addedSize)
 	c.updateMemSize(int64(addedSize))
@@ -337,11 +340,16 @@ func (c *Cache) WriteMulti(values map[string][]Value) error {
 	// We'll optimistially set size here, and then decrement it for write errors.
 	c.increaseSize(addedSize)
 	for k, v := range values {
-		if err := store.write([]byte(k), v); err != nil {
+		newKey, err := store.write([]byte(k), v)
+		if err != nil {
 			// The write failed, hold onto the error and adjust the size delta.
 			werr = err
 			addedSize -= uint64(Values(v).Size())
 			c.decreaseSize(uint64(Values(v).Size()))
+		}
+		if newKey {
+			addedSize += uint64(len(k))
+			c.increaseSize(uint64(len(k)))
 		}
 	}
 
@@ -355,6 +363,10 @@ func (c *Cache) WriteMulti(values map[string][]Value) error {
 	// Update the memory size stat
 	c.updateMemSize(int64(addedSize))
 	atomic.AddInt64(&c.stats.WriteOK, 1)
+
+	c.mu.Lock()
+	c.lastWriteTime = time.Now()
+	c.mu.Unlock()
 
 	return werr
 }
@@ -428,6 +440,15 @@ func (c *Cache) Deduplicate() {
 func (c *Cache) ClearSnapshot(success bool) {
 	c.init()
 
+	c.mu.RLock()
+	snapStore := c.snapshot.store
+	c.mu.RUnlock()
+
+	// reset the snapshot store outside of the write lock
+	if success {
+		snapStore.reset()
+	}
+
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -437,8 +458,7 @@ func (c *Cache) ClearSnapshot(success bool) {
 		c.snapshotAttempts = 0
 		c.updateMemSize(-int64(atomic.LoadUint64(&c.snapshotSize))) // decrement the number of bytes in cache
 
-		// Reset the snapshot's store, and reset the snapshot to a fresh Cache.
-		c.snapshot.store.reset()
+		// Reset the snapshot to a fresh Cache.
 		c.snapshot = &Cache{
 			store: c.snapshot.store,
 		}
@@ -469,6 +489,13 @@ func (c *Cache) MaxSize() uint64 {
 	return c.maxSize
 }
 
+func (c *Cache) Count() int {
+	c.mu.RLock()
+	n := c.store.count()
+	c.mu.RUnlock()
+	return n
+}
+
 // Keys returns a sorted slice of all keys under management by the cache.
 func (c *Cache) Keys() [][]byte {
 	c.mu.RLock()
@@ -477,13 +504,51 @@ func (c *Cache) Keys() [][]byte {
 	return store.keys(true)
 }
 
-// unsortedKeys returns a slice of all keys under management by the cache. The
-// keys are not sorted.
-func (c *Cache) unsortedKeys() [][]byte {
+func (c *Cache) Split(n int) []*Cache {
+	if n == 1 {
+		return []*Cache{c}
+	}
+
+	caches := make([]*Cache, n)
+	storers := c.store.split(n)
+	for i := 0; i < n; i++ {
+		caches[i] = &Cache{
+			store: storers[i],
+		}
+	}
+	return caches
+}
+
+// Type returns the series type for a key.
+func (c *Cache) Type(key []byte) (models.FieldType, error) {
 	c.mu.RLock()
-	store := c.store
+	e := c.store.entry(key)
+	if e == nil && c.snapshot != nil {
+		e = c.snapshot.store.entry(key)
+	}
 	c.mu.RUnlock()
-	return store.keys(false)
+
+	if e != nil {
+		typ, err := e.InfluxQLType()
+		if err != nil {
+			return models.Empty, tsdb.ErrUnknownFieldType
+		}
+
+		switch typ {
+		case influxql.Float:
+			return models.Float, nil
+		case influxql.Integer:
+			return models.Integer, nil
+		case influxql.Unsigned:
+			return models.Unsigned, nil
+		case influxql.Boolean:
+			return models.Boolean, nil
+		case influxql.String:
+			return models.String, nil
+		}
+	}
+
+	return models.Empty, tsdb.ErrUnknownFieldType
 }
 
 // Values returns a copy of all values, deduped and sorted, for the given key.
@@ -567,7 +632,7 @@ func (c *Cache) DeleteRange(keys [][]byte, min, max int64) {
 
 		origSize := uint64(e.size())
 		if min == math.MinInt64 && max == math.MaxInt64 {
-			c.decreaseSize(origSize)
+			c.decreaseSize(origSize + uint64(len(k)))
 			c.store.remove(k)
 			continue
 		}
@@ -575,7 +640,7 @@ func (c *Cache) DeleteRange(keys [][]byte, min, max int64) {
 		e.filter(min, max)
 		if e.count() == 0 {
 			c.store.remove(k)
-			c.decreaseSize(origSize)
+			c.decreaseSize(origSize + uint64(len(k)))
 			continue
 		}
 
@@ -621,14 +686,14 @@ func (c *Cache) ApplyEntryFn(f func(key []byte, entry *entry) error) error {
 type CacheLoader struct {
 	files []string
 
-	Logger zap.Logger
+	Logger *zap.Logger
 }
 
 // NewCacheLoader returns a new instance of a CacheLoader.
 func NewCacheLoader(files []string) *CacheLoader {
 	return &CacheLoader{
 		files:  files,
-		Logger: zap.New(zap.NullEncoder()),
+		Logger: zap.NewNop(),
 	}
 }
 
@@ -652,7 +717,7 @@ func (cl *CacheLoader) Load(cache *Cache) error {
 			if err != nil {
 				return err
 			}
-			cl.Logger.Info(fmt.Sprintf("reading file %s, size %d", f.Name(), stat.Size()))
+			cl.Logger.Info("Reading file", zap.String("path", f.Name()), zap.Int64("size", stat.Size()))
 
 			// Nothing to read, skip it
 			if stat.Size() == 0 {
@@ -670,7 +735,7 @@ func (cl *CacheLoader) Load(cache *Cache) error {
 				entry, err := r.Read()
 				if err != nil {
 					n := r.Count()
-					cl.Logger.Info(fmt.Sprintf("file %s corrupt at position %d, truncating", f.Name(), n))
+					cl.Logger.Info("File corrupt", zap.Error(err), zap.String("path", f.Name()), zap.Int64("pos", n))
 					if err := f.Truncate(n); err != nil {
 						return err
 					}
@@ -698,8 +763,14 @@ func (cl *CacheLoader) Load(cache *Cache) error {
 }
 
 // WithLogger sets the logger on the CacheLoader.
-func (cl *CacheLoader) WithLogger(log zap.Logger) {
+func (cl *CacheLoader) WithLogger(log *zap.Logger) {
 	cl.Logger = log.With(zap.String("service", "cacheloader"))
+}
+
+func (c *Cache) LastWriteTime() time.Time {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lastWriteTime
 }
 
 // UpdateAge updates the age statistic based on the current time.
@@ -725,7 +796,7 @@ func (c *Cache) updateMemSize(b int64) {
 	atomic.AddInt64(&c.stats.MemSizeBytes, b)
 }
 
-func valueType(v Value) int {
+func valueType(v Value) byte {
 	switch v.(type) {
 	case FloatValue:
 		return 1
@@ -750,10 +821,12 @@ func (c *Cache) updateSnapshots() {
 type emptyStore struct{}
 
 func (e emptyStore) entry(key []byte) *entry                        { return nil }
-func (e emptyStore) write(key []byte, values Values) error          { return nil }
+func (e emptyStore) write(key []byte, values Values) (bool, error)  { return false, nil }
 func (e emptyStore) add(key []byte, entry *entry)                   {}
 func (e emptyStore) remove(key []byte)                              {}
 func (e emptyStore) keys(sorted bool) [][]byte                      { return nil }
 func (e emptyStore) apply(f func([]byte, *entry) error) error       { return nil }
 func (e emptyStore) applySerial(f func([]byte, *entry) error) error { return nil }
 func (e emptyStore) reset()                                         {}
+func (e emptyStore) split(n int) []storer                           { return nil }
+func (e emptyStore) count() int                                     { return 0 }

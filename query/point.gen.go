@@ -7,6 +7,7 @@
 package query
 
 import (
+	"context"
 	"encoding/binary"
 	"io"
 
@@ -60,9 +61,13 @@ func (v *FloatPoint) Clone() *FloatPoint {
 
 // CopyTo makes a deep copy into the point.
 func (v *FloatPoint) CopyTo(other *FloatPoint) {
-	*other = *v
+	other.Name, other.Tags = v.Name, v.Tags
+	other.Time = v.Time
+	other.Value, other.Nil = v.Value, v.Nil
 	if v.Aux != nil {
-		other.Aux = make([]interface{}, len(v.Aux))
+		if len(other.Aux) != len(v.Aux) {
+			other.Aux = make([]interface{}, len(v.Aux))
+		}
 		copy(other.Aux, v.Aux)
 	}
 }
@@ -181,11 +186,12 @@ func (enc *FloatPointEncoder) EncodeFloatPoint(p *FloatPoint) error {
 type FloatPointDecoder struct {
 	r     io.Reader
 	stats IteratorStats
+	ctx   context.Context
 }
 
 // NewFloatPointDecoder returns a new instance of FloatPointDecoder that reads from r.
-func NewFloatPointDecoder(r io.Reader) *FloatPointDecoder {
-	return &FloatPointDecoder{r: r}
+func NewFloatPointDecoder(ctx context.Context, r io.Reader) *FloatPointDecoder {
+	return &FloatPointDecoder{r: r, ctx: ctx}
 }
 
 // Stats returns iterator stats embedded within the stream.
@@ -215,6 +221,15 @@ func (dec *FloatPointDecoder) DecodeFloatPoint(p *FloatPoint) error {
 		// If the point contains stats then read stats and retry.
 		if pb.Stats != nil {
 			dec.stats = decodeIteratorStats(pb.Stats)
+			continue
+		}
+
+		if len(pb.Trace) > 0 {
+			var err error
+			err = decodeIteratorTrace(dec.ctx, pb.Trace)
+			if err != nil {
+				return err
+			}
 			continue
 		}
 
@@ -271,9 +286,13 @@ func (v *IntegerPoint) Clone() *IntegerPoint {
 
 // CopyTo makes a deep copy into the point.
 func (v *IntegerPoint) CopyTo(other *IntegerPoint) {
-	*other = *v
+	other.Name, other.Tags = v.Name, v.Tags
+	other.Time = v.Time
+	other.Value, other.Nil = v.Value, v.Nil
 	if v.Aux != nil {
-		other.Aux = make([]interface{}, len(v.Aux))
+		if len(other.Aux) != len(v.Aux) {
+			other.Aux = make([]interface{}, len(v.Aux))
+		}
 		copy(other.Aux, v.Aux)
 	}
 }
@@ -392,11 +411,12 @@ func (enc *IntegerPointEncoder) EncodeIntegerPoint(p *IntegerPoint) error {
 type IntegerPointDecoder struct {
 	r     io.Reader
 	stats IteratorStats
+	ctx   context.Context
 }
 
 // NewIntegerPointDecoder returns a new instance of IntegerPointDecoder that reads from r.
-func NewIntegerPointDecoder(r io.Reader) *IntegerPointDecoder {
-	return &IntegerPointDecoder{r: r}
+func NewIntegerPointDecoder(ctx context.Context, r io.Reader) *IntegerPointDecoder {
+	return &IntegerPointDecoder{r: r, ctx: ctx}
 }
 
 // Stats returns iterator stats embedded within the stream.
@@ -426,6 +446,15 @@ func (dec *IntegerPointDecoder) DecodeIntegerPoint(p *IntegerPoint) error {
 		// If the point contains stats then read stats and retry.
 		if pb.Stats != nil {
 			dec.stats = decodeIteratorStats(pb.Stats)
+			continue
+		}
+
+		if len(pb.Trace) > 0 {
+			var err error
+			err = decodeIteratorTrace(dec.ctx, pb.Trace)
+			if err != nil {
+				return err
+			}
 			continue
 		}
 
@@ -482,9 +511,13 @@ func (v *UnsignedPoint) Clone() *UnsignedPoint {
 
 // CopyTo makes a deep copy into the point.
 func (v *UnsignedPoint) CopyTo(other *UnsignedPoint) {
-	*other = *v
+	other.Name, other.Tags = v.Name, v.Tags
+	other.Time = v.Time
+	other.Value, other.Nil = v.Value, v.Nil
 	if v.Aux != nil {
-		other.Aux = make([]interface{}, len(v.Aux))
+		if len(other.Aux) != len(v.Aux) {
+			other.Aux = make([]interface{}, len(v.Aux))
+		}
 		copy(other.Aux, v.Aux)
 	}
 }
@@ -601,11 +634,12 @@ func (enc *UnsignedPointEncoder) EncodeUnsignedPoint(p *UnsignedPoint) error {
 type UnsignedPointDecoder struct {
 	r     io.Reader
 	stats IteratorStats
+	ctx   context.Context
 }
 
 // NewUnsignedPointDecoder returns a new instance of UnsignedPointDecoder that reads from r.
-func NewUnsignedPointDecoder(r io.Reader) *UnsignedPointDecoder {
-	return &UnsignedPointDecoder{r: r}
+func NewUnsignedPointDecoder(ctx context.Context, r io.Reader) *UnsignedPointDecoder {
+	return &UnsignedPointDecoder{r: r, ctx: ctx}
 }
 
 // Stats returns iterator stats embedded within the stream.
@@ -635,6 +669,15 @@ func (dec *UnsignedPointDecoder) DecodeUnsignedPoint(p *UnsignedPoint) error {
 		// If the point contains stats then read stats and retry.
 		if pb.Stats != nil {
 			dec.stats = decodeIteratorStats(pb.Stats)
+			continue
+		}
+
+		if len(pb.Trace) > 0 {
+			var err error
+			err = decodeIteratorTrace(dec.ctx, pb.Trace)
+			if err != nil {
+				return err
+			}
 			continue
 		}
 
@@ -691,9 +734,13 @@ func (v *StringPoint) Clone() *StringPoint {
 
 // CopyTo makes a deep copy into the point.
 func (v *StringPoint) CopyTo(other *StringPoint) {
-	*other = *v
+	other.Name, other.Tags = v.Name, v.Tags
+	other.Time = v.Time
+	other.Value, other.Nil = v.Value, v.Nil
 	if v.Aux != nil {
-		other.Aux = make([]interface{}, len(v.Aux))
+		if len(other.Aux) != len(v.Aux) {
+			other.Aux = make([]interface{}, len(v.Aux))
+		}
 		copy(other.Aux, v.Aux)
 	}
 }
@@ -812,11 +859,12 @@ func (enc *StringPointEncoder) EncodeStringPoint(p *StringPoint) error {
 type StringPointDecoder struct {
 	r     io.Reader
 	stats IteratorStats
+	ctx   context.Context
 }
 
 // NewStringPointDecoder returns a new instance of StringPointDecoder that reads from r.
-func NewStringPointDecoder(r io.Reader) *StringPointDecoder {
-	return &StringPointDecoder{r: r}
+func NewStringPointDecoder(ctx context.Context, r io.Reader) *StringPointDecoder {
+	return &StringPointDecoder{r: r, ctx: ctx}
 }
 
 // Stats returns iterator stats embedded within the stream.
@@ -846,6 +894,15 @@ func (dec *StringPointDecoder) DecodeStringPoint(p *StringPoint) error {
 		// If the point contains stats then read stats and retry.
 		if pb.Stats != nil {
 			dec.stats = decodeIteratorStats(pb.Stats)
+			continue
+		}
+
+		if len(pb.Trace) > 0 {
+			var err error
+			err = decodeIteratorTrace(dec.ctx, pb.Trace)
+			if err != nil {
+				return err
+			}
 			continue
 		}
 
@@ -902,9 +959,13 @@ func (v *BooleanPoint) Clone() *BooleanPoint {
 
 // CopyTo makes a deep copy into the point.
 func (v *BooleanPoint) CopyTo(other *BooleanPoint) {
-	*other = *v
+	other.Name, other.Tags = v.Name, v.Tags
+	other.Time = v.Time
+	other.Value, other.Nil = v.Value, v.Nil
 	if v.Aux != nil {
-		other.Aux = make([]interface{}, len(v.Aux))
+		if len(other.Aux) != len(v.Aux) {
+			other.Aux = make([]interface{}, len(v.Aux))
+		}
 		copy(other.Aux, v.Aux)
 	}
 }
@@ -1023,11 +1084,12 @@ func (enc *BooleanPointEncoder) EncodeBooleanPoint(p *BooleanPoint) error {
 type BooleanPointDecoder struct {
 	r     io.Reader
 	stats IteratorStats
+	ctx   context.Context
 }
 
 // NewBooleanPointDecoder returns a new instance of BooleanPointDecoder that reads from r.
-func NewBooleanPointDecoder(r io.Reader) *BooleanPointDecoder {
-	return &BooleanPointDecoder{r: r}
+func NewBooleanPointDecoder(ctx context.Context, r io.Reader) *BooleanPointDecoder {
+	return &BooleanPointDecoder{r: r, ctx: ctx}
 }
 
 // Stats returns iterator stats embedded within the stream.
@@ -1057,6 +1119,15 @@ func (dec *BooleanPointDecoder) DecodeBooleanPoint(p *BooleanPoint) error {
 		// If the point contains stats then read stats and retry.
 		if pb.Stats != nil {
 			dec.stats = decodeIteratorStats(pb.Stats)
+			continue
+		}
+
+		if len(pb.Trace) > 0 {
+			var err error
+			err = decodeIteratorTrace(dec.ctx, pb.Trace)
+			if err != nil {
+				return err
+			}
 			continue
 		}
 

@@ -1,13 +1,16 @@
 package query
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 	"time"
 
-	"github.com/influxdata/influxdb/influxql"
 	"github.com/influxdata/influxdb/models"
-	"github.com/uber-go/zap"
+	"github.com/influxdata/influxql"
+	"go.uber.org/zap"
 )
 
 const (
@@ -15,6 +18,46 @@ const (
 	// A value of zero will have no query timeout.
 	DefaultQueryTimeout = time.Duration(0)
 )
+
+type TaskStatus int
+
+const (
+	// RunningTask is set when the task is running.
+	RunningTask TaskStatus = iota + 1
+
+	// KilledTask is set when the task is killed, but resources are still
+	// being used.
+	KilledTask
+)
+
+func (t TaskStatus) String() string {
+	switch t {
+	case RunningTask:
+		return "running"
+	case KilledTask:
+		return "killed"
+	default:
+		return "unknown"
+	}
+}
+
+func (t TaskStatus) MarshalJSON() ([]byte, error) {
+	s := t.String()
+	return json.Marshal(s)
+}
+
+func (t *TaskStatus) UnmarshalJSON(data []byte) error {
+	if bytes.Equal(data, []byte("running")) {
+		*t = RunningTask
+	} else if bytes.Equal(data, []byte("killed")) {
+		*t = KilledTask
+	} else if bytes.Equal(data, []byte("unknown")) {
+		*t = TaskStatus(0)
+	} else {
+		return fmt.Errorf("unknown task status: %s", string(data))
+	}
+	return nil
+}
 
 // TaskManager takes care of all aspects related to managing running queries.
 type TaskManager struct {
@@ -30,10 +73,10 @@ type TaskManager struct {
 
 	// Logger to use for all logging.
 	// Defaults to discarding all log output.
-	Logger zap.Logger
+	Logger *zap.Logger
 
 	// Used for managing and tracking running queries.
-	queries  map[uint64]*QueryTask
+	queries  map[uint64]*Task
 	nextID   uint64
 	mu       sync.RWMutex
 	shutdown bool
@@ -43,14 +86,14 @@ type TaskManager struct {
 func NewTaskManager() *TaskManager {
 	return &TaskManager{
 		QueryTimeout: DefaultQueryTimeout,
-		Logger:       zap.New(zap.NullEncoder()),
-		queries:      make(map[uint64]*QueryTask),
+		Logger:       zap.NewNop(),
+		queries:      make(map[uint64]*Task),
 		nextID:       1,
 	}
 }
 
 // ExecuteStatement executes a statement containing one of the task management queries.
-func (t *TaskManager) ExecuteStatement(stmt influxql.Statement, ctx ExecutionContext) error {
+func (t *TaskManager) ExecuteStatement(stmt influxql.Statement, ctx *ExecutionContext) error {
 	switch stmt := stmt.(type) {
 	case *influxql.ShowQueriesStatement:
 		rows, err := t.executeShowQueriesStatement(stmt)
@@ -58,10 +101,9 @@ func (t *TaskManager) ExecuteStatement(stmt influxql.Statement, ctx ExecutionCon
 			return err
 		}
 
-		ctx.Results <- &Result{
-			StatementID: ctx.StatementID,
-			Series:      rows,
-		}
+		ctx.Send(&Result{
+			Series: rows,
+		})
 	case *influxql.KillQueryStatement:
 		var messages []*Message
 		if ctx.ReadOnly {
@@ -71,10 +113,9 @@ func (t *TaskManager) ExecuteStatement(stmt influxql.Statement, ctx ExecutionCon
 		if err := t.executeKillQueryStatement(stmt); err != nil {
 			return err
 		}
-		ctx.Results <- &Result{
-			StatementID: ctx.StatementID,
-			Messages:    messages,
-		}
+		ctx.Send(&Result{
+			Messages: messages,
+		})
 	default:
 		return ErrInvalidQuery
 	}
@@ -104,11 +145,11 @@ func (t *TaskManager) executeShowQueriesStatement(q *influxql.ShowQueriesStateme
 			d = d - (d % time.Microsecond)
 		}
 
-		values = append(values, []interface{}{id, qi.query, qi.database, d.String()})
+		values = append(values, []interface{}{id, qi.query, qi.database, d.String(), qi.status.String()})
 	}
 
 	return []*models.Row{{
-		Columns: []string{"qid", "query", "database", "duration"},
+		Columns: []string{"qid", "query", "database", "duration", "status"},
 		Values:  values,
 	}}, nil
 }
@@ -129,22 +170,23 @@ func (t *TaskManager) queryError(qid uint64, err error) {
 // query finishes running.
 //
 // After a query finishes running, the system is free to reuse a query id.
-func (t *TaskManager) AttachQuery(q *influxql.Query, database string, interrupt <-chan struct{}) (uint64, *QueryTask, error) {
+func (t *TaskManager) AttachQuery(q *influxql.Query, opt ExecutionOptions, interrupt <-chan struct{}) (*ExecutionContext, func(), error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	if t.shutdown {
-		return 0, nil, ErrQueryEngineShutdown
+		return nil, nil, ErrQueryEngineShutdown
 	}
 
 	if t.MaxConcurrentQueries > 0 && len(t.queries) >= t.MaxConcurrentQueries {
-		return 0, nil, ErrMaxConcurrentQueriesLimitExceeded(len(t.queries), t.MaxConcurrentQueries)
+		return nil, nil, ErrMaxConcurrentQueriesLimitExceeded(len(t.queries), t.MaxConcurrentQueries)
 	}
 
 	qid := t.nextID
-	query := &QueryTask{
+	query := &Task{
 		query:     q.String(),
-		database:  database,
+		database:  opt.Database,
+		status:    RunningTask,
 		startTime: time.Now(),
 		closing:   make(chan struct{}),
 		monitorCh: make(chan error),
@@ -167,12 +209,34 @@ func (t *TaskManager) AttachQuery(q *influxql.Query, database string, interrupt 
 		})
 	}
 	t.nextID++
-	return qid, query, nil
+
+	ctx := &ExecutionContext{
+		Context:          context.Background(),
+		QueryID:          qid,
+		task:             query,
+		ExecutionOptions: opt,
+	}
+	ctx.watch()
+	return ctx, func() { t.DetachQuery(qid) }, nil
 }
 
-// KillQuery stops and removes a query from the TaskManager.
-// This method can be used to forcefully terminate a running query.
+// KillQuery enters a query into the killed state and closes the channel
+// from the TaskManager. This method can be used to forcefully terminate a
+// running query.
 func (t *TaskManager) KillQuery(qid uint64) error {
+	t.mu.Lock()
+	query := t.queries[qid]
+	t.mu.Unlock()
+
+	if query == nil {
+		return fmt.Errorf("no such query id: %d", qid)
+	}
+	return query.kill()
+}
+
+// DetachQuery removes a query from the query table. If the query is not in the
+// killed state, this will also close the related channel.
+func (t *TaskManager) DetachQuery(qid uint64) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -181,7 +245,7 @@ func (t *TaskManager) KillQuery(qid uint64) error {
 		return fmt.Errorf("no such query id: %d", qid)
 	}
 
-	close(query.closing)
+	query.close()
 	delete(t.queries, qid)
 	return nil
 }
@@ -192,6 +256,7 @@ type QueryInfo struct {
 	Query    string        `json:"query"`
 	Database string        `json:"database"`
 	Duration time.Duration `json:"duration"`
+	Status   TaskStatus    `json:"status"`
 }
 
 // Queries returns a list of all running queries with information about them.
@@ -207,6 +272,7 @@ func (t *TaskManager) Queries() []QueryInfo {
 			Query:    qi.query,
 			Database: qi.database,
 			Duration: now.Sub(qi.startTime),
+			Status:   qi.status,
 		})
 	}
 	return queries
@@ -246,7 +312,7 @@ func (t *TaskManager) Close() error {
 	t.shutdown = true
 	for _, query := range t.queries {
 		query.setError(ErrQueryEngineShutdown)
-		close(query.closing)
+		query.close()
 	}
 	t.queries = nil
 	return nil

@@ -72,7 +72,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-
+	defer c.Close()
+	
 	// Create a new point batch
 	bp, err := client.NewBatchPoints(client.BatchPointsConfig{
 		Database:  MyDB,
@@ -99,6 +100,11 @@ func main() {
 	// Write the batch
 	if err := c.Write(bp); err != nil {
 		log.Fatal(err)
+	}
+	
+	// Close client resources
+	if err := c.Close(); err != nil {
+    		log.Fatal(err)
 	}
 }
 
@@ -163,6 +169,14 @@ func writePoints(clnt client.Client) {
 	}
 }
 ```
+
+#### Uint64 Support
+
+The `uint64` data type is supported if your server is version `1.4.0` or
+greater. To write a data point as an unsigned integer, you must insert
+the point as `uint64`. You cannot use `uint` or any of the other
+derivatives because previous versions of the client have supported
+writing those types as an integer.
 
 ### Querying Data
 

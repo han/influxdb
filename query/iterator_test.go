@@ -2,17 +2,17 @@ package query_test
 
 import (
 	"bytes"
+	"context"
 	"fmt"
-	"math"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/davecgh/go-spew/spew"
-	"github.com/influxdata/influxdb/influxql"
 	"github.com/influxdata/influxdb/pkg/deep"
 	"github.com/influxdata/influxdb/query"
+	"github.com/influxdata/influxql"
 )
 
 // Ensure that a set of iterators can be merged together, sorted by window and name/tag.
@@ -103,6 +103,55 @@ func TestMergeIterator_Integer(t *testing.T) {
 		{&query.IntegerPoint{Name: "cpu", Tags: ParseTags("host=B"), Time: 13, Value: 6}},
 		{&query.IntegerPoint{Name: "mem", Tags: ParseTags("host=A"), Time: 25, Value: 9}},
 		{&query.IntegerPoint{Name: "mem", Tags: ParseTags("host=B"), Time: 11, Value: 8}},
+	}) {
+		t.Errorf("unexpected points: %s", spew.Sdump(a))
+	}
+
+	for i, input := range inputs {
+		if !input.Closed {
+			t.Errorf("iterator %d not closed", i)
+		}
+	}
+}
+
+// Ensure that a set of iterators can be merged together, sorted by window and name/tag.
+func TestMergeIterator_Unsigned(t *testing.T) {
+	inputs := []*UnsignedIterator{
+		{Points: []query.UnsignedPoint{
+			{Name: "cpu", Tags: ParseTags("host=A"), Time: 0, Value: 1},
+			{Name: "cpu", Tags: ParseTags("host=A"), Time: 12, Value: 3},
+			{Name: "cpu", Tags: ParseTags("host=A"), Time: 30, Value: 4},
+			{Name: "cpu", Tags: ParseTags("host=B"), Time: 1, Value: 2},
+			{Name: "mem", Tags: ParseTags("host=B"), Time: 11, Value: 8},
+		}},
+		{Points: []query.UnsignedPoint{
+			{Name: "cpu", Tags: ParseTags("host=A"), Time: 20, Value: 7},
+			{Name: "cpu", Tags: ParseTags("host=B"), Time: 11, Value: 5},
+			{Name: "cpu", Tags: ParseTags("host=B"), Time: 13, Value: 6},
+			{Name: "mem", Tags: ParseTags("host=A"), Time: 25, Value: 9},
+		}},
+		{Points: []query.UnsignedPoint{}},
+	}
+	itr := query.NewMergeIterator(UnsignedIterators(inputs), query.IteratorOptions{
+		Interval: query.Interval{
+			Duration: 10 * time.Nanosecond,
+		},
+		Dimensions: []string{"host"},
+		Ascending:  true,
+	})
+
+	if a, err := Iterators([]query.Iterator{itr}).ReadAll(); err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	} else if !deep.Equal(a, [][]query.Point{
+		{&query.UnsignedPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 0, Value: 1}},
+		{&query.UnsignedPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 12, Value: 3}},
+		{&query.UnsignedPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 20, Value: 7}},
+		{&query.UnsignedPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 30, Value: 4}},
+		{&query.UnsignedPoint{Name: "cpu", Tags: ParseTags("host=B"), Time: 1, Value: 2}},
+		{&query.UnsignedPoint{Name: "cpu", Tags: ParseTags("host=B"), Time: 11, Value: 5}},
+		{&query.UnsignedPoint{Name: "cpu", Tags: ParseTags("host=B"), Time: 13, Value: 6}},
+		{&query.UnsignedPoint{Name: "mem", Tags: ParseTags("host=A"), Time: 25, Value: 9}},
+		{&query.UnsignedPoint{Name: "mem", Tags: ParseTags("host=B"), Time: 11, Value: 8}},
 	}) {
 		t.Errorf("unexpected points: %s", spew.Sdump(a))
 	}
@@ -219,20 +268,23 @@ func TestMergeIterator_Nil(t *testing.T) {
 	}
 }
 
-func TestMergeIterator_Cast_Float(t *testing.T) {
+// Verifies that coercing will drop values that aren't the primary type.
+// It's the responsibility of the engine to return the correct type. If they don't,
+// we drop iterators that don't match.
+func TestMergeIterator_Coerce_Float(t *testing.T) {
 	inputs := []query.Iterator{
+		&FloatIterator{Points: []query.FloatPoint{
+			{Name: "cpu", Tags: ParseTags("host=A"), Time: 20, Value: 7},
+			{Name: "cpu", Tags: ParseTags("host=B"), Time: 11, Value: 5},
+			{Name: "cpu", Tags: ParseTags("host=B"), Time: 13, Value: 6},
+			{Name: "mem", Tags: ParseTags("host=A"), Time: 25, Value: 9},
+		}},
 		&IntegerIterator{Points: []query.IntegerPoint{
 			{Name: "cpu", Tags: ParseTags("host=A"), Time: 0, Value: 1},
 			{Name: "cpu", Tags: ParseTags("host=A"), Time: 12, Value: 3},
 			{Name: "cpu", Tags: ParseTags("host=A"), Time: 30, Value: 4},
 			{Name: "cpu", Tags: ParseTags("host=B"), Time: 1, Value: 2},
 			{Name: "mem", Tags: ParseTags("host=B"), Time: 11, Value: 8},
-		}},
-		&FloatIterator{Points: []query.FloatPoint{
-			{Name: "cpu", Tags: ParseTags("host=A"), Time: 20, Value: 7},
-			{Name: "cpu", Tags: ParseTags("host=B"), Time: 11, Value: 5},
-			{Name: "cpu", Tags: ParseTags("host=B"), Time: 13, Value: 6},
-			{Name: "mem", Tags: ParseTags("host=A"), Time: 25, Value: 9},
 		}},
 	}
 
@@ -246,15 +298,10 @@ func TestMergeIterator_Cast_Float(t *testing.T) {
 	if a, err := Iterators([]query.Iterator{itr}).ReadAll(); err != nil {
 		t.Fatalf("unexpected error: %s", err)
 	} else if !deep.Equal(a, [][]query.Point{
-		{&query.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 0, Value: 1}},
-		{&query.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 12, Value: 3}},
 		{&query.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 20, Value: 7}},
-		{&query.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 30, Value: 4}},
-		{&query.FloatPoint{Name: "cpu", Tags: ParseTags("host=B"), Time: 1, Value: 2}},
 		{&query.FloatPoint{Name: "cpu", Tags: ParseTags("host=B"), Time: 11, Value: 5}},
 		{&query.FloatPoint{Name: "cpu", Tags: ParseTags("host=B"), Time: 13, Value: 6}},
 		{&query.FloatPoint{Name: "mem", Tags: ParseTags("host=A"), Time: 25, Value: 9}},
-		{&query.FloatPoint{Name: "mem", Tags: ParseTags("host=B"), Time: 11, Value: 8}},
 	}) {
 		t.Errorf("unexpected points: %s", spew.Sdump(a))
 	}
@@ -266,6 +313,10 @@ func TestMergeIterator_Cast_Float(t *testing.T) {
 				t.Errorf("iterator %d not closed", i)
 			}
 		case *IntegerIterator:
+			if !input.Closed {
+				t.Errorf("iterator %d not closed", i)
+			}
+		case *UnsignedIterator:
 			if !input.Closed {
 				t.Errorf("iterator %d not closed", i)
 			}
@@ -358,6 +409,54 @@ func TestSortedMergeIterator_Integer(t *testing.T) {
 		{&query.IntegerPoint{Name: "cpu", Tags: ParseTags("host=B"), Time: 13, Value: 6}},
 		{&query.IntegerPoint{Name: "mem", Tags: ParseTags("host=A"), Time: 25, Value: 9}},
 		{&query.IntegerPoint{Name: "mem", Tags: ParseTags("host=B"), Time: 4, Value: 8}},
+	}) {
+		t.Errorf("unexpected points: %s", spew.Sdump(a))
+	}
+
+	for i, input := range inputs {
+		if !input.Closed {
+			t.Errorf("iterator %d not closed", i)
+		}
+	}
+}
+
+// Ensure that a set of iterators can be merged together, sorted by name/tag.
+func TestSortedMergeIterator_Unsigned(t *testing.T) {
+	inputs := []*UnsignedIterator{
+		{Points: []query.UnsignedPoint{
+			{Name: "cpu", Tags: ParseTags("host=A"), Time: 0, Value: 1},
+			{Name: "cpu", Tags: ParseTags("host=A"), Time: 12, Value: 3},
+			{Name: "cpu", Tags: ParseTags("host=A"), Time: 30, Value: 4},
+			{Name: "cpu", Tags: ParseTags("host=B"), Time: 1, Value: 2},
+			{Name: "mem", Tags: ParseTags("host=B"), Time: 4, Value: 8},
+		}},
+		{Points: []query.UnsignedPoint{
+			{Name: "cpu", Tags: ParseTags("host=A"), Time: 20, Value: 7},
+			{Name: "cpu", Tags: ParseTags("host=B"), Time: 11, Value: 5},
+			{Name: "cpu", Tags: ParseTags("host=B"), Time: 13, Value: 6},
+			{Name: "mem", Tags: ParseTags("host=A"), Time: 25, Value: 9},
+		}},
+		{Points: []query.UnsignedPoint{}},
+	}
+	itr := query.NewSortedMergeIterator(UnsignedIterators(inputs), query.IteratorOptions{
+		Interval: query.Interval{
+			Duration: 10 * time.Nanosecond,
+		},
+		Dimensions: []string{"host"},
+		Ascending:  true,
+	})
+	if a, err := Iterators([]query.Iterator{itr}).ReadAll(); err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	} else if !deep.Equal(a, [][]query.Point{
+		{&query.UnsignedPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 0, Value: 1}},
+		{&query.UnsignedPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 12, Value: 3}},
+		{&query.UnsignedPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 20, Value: 7}},
+		{&query.UnsignedPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 30, Value: 4}},
+		{&query.UnsignedPoint{Name: "cpu", Tags: ParseTags("host=B"), Time: 1, Value: 2}},
+		{&query.UnsignedPoint{Name: "cpu", Tags: ParseTags("host=B"), Time: 11, Value: 5}},
+		{&query.UnsignedPoint{Name: "cpu", Tags: ParseTags("host=B"), Time: 13, Value: 6}},
+		{&query.UnsignedPoint{Name: "mem", Tags: ParseTags("host=A"), Time: 25, Value: 9}},
+		{&query.UnsignedPoint{Name: "mem", Tags: ParseTags("host=B"), Time: 4, Value: 8}},
 	}) {
 		t.Errorf("unexpected points: %s", spew.Sdump(a))
 	}
@@ -472,20 +571,20 @@ func TestSortedMergeIterator_Nil(t *testing.T) {
 	}
 }
 
-func TestSortedMergeIterator_Cast_Float(t *testing.T) {
+func TestSortedMergeIterator_Coerce_Float(t *testing.T) {
 	inputs := []query.Iterator{
+		&FloatIterator{Points: []query.FloatPoint{
+			{Name: "cpu", Tags: ParseTags("host=A"), Time: 20, Value: 7},
+			{Name: "cpu", Tags: ParseTags("host=B"), Time: 11, Value: 5},
+			{Name: "cpu", Tags: ParseTags("host=B"), Time: 13, Value: 6},
+			{Name: "mem", Tags: ParseTags("host=A"), Time: 25, Value: 9},
+		}},
 		&IntegerIterator{Points: []query.IntegerPoint{
 			{Name: "cpu", Tags: ParseTags("host=A"), Time: 0, Value: 1},
 			{Name: "cpu", Tags: ParseTags("host=A"), Time: 12, Value: 3},
 			{Name: "cpu", Tags: ParseTags("host=A"), Time: 30, Value: 4},
 			{Name: "cpu", Tags: ParseTags("host=B"), Time: 1, Value: 2},
 			{Name: "mem", Tags: ParseTags("host=B"), Time: 4, Value: 8},
-		}},
-		&FloatIterator{Points: []query.FloatPoint{
-			{Name: "cpu", Tags: ParseTags("host=A"), Time: 20, Value: 7},
-			{Name: "cpu", Tags: ParseTags("host=B"), Time: 11, Value: 5},
-			{Name: "cpu", Tags: ParseTags("host=B"), Time: 13, Value: 6},
-			{Name: "mem", Tags: ParseTags("host=A"), Time: 25, Value: 9},
 		}},
 	}
 
@@ -499,15 +598,10 @@ func TestSortedMergeIterator_Cast_Float(t *testing.T) {
 	if a, err := Iterators([]query.Iterator{itr}).ReadAll(); err != nil {
 		t.Fatalf("unexpected error: %s", err)
 	} else if !deep.Equal(a, [][]query.Point{
-		{&query.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 0, Value: 1}},
-		{&query.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 12, Value: 3}},
 		{&query.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 20, Value: 7}},
-		{&query.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 30, Value: 4}},
-		{&query.FloatPoint{Name: "cpu", Tags: ParseTags("host=B"), Time: 1, Value: 2}},
 		{&query.FloatPoint{Name: "cpu", Tags: ParseTags("host=B"), Time: 11, Value: 5}},
 		{&query.FloatPoint{Name: "cpu", Tags: ParseTags("host=B"), Time: 13, Value: 6}},
 		{&query.FloatPoint{Name: "mem", Tags: ParseTags("host=A"), Time: 25, Value: 9}},
-		{&query.FloatPoint{Name: "mem", Tags: ParseTags("host=B"), Time: 4, Value: 8}},
 	}) {
 		t.Errorf("unexpected points: %s", spew.Sdump(a))
 	}
@@ -519,6 +613,10 @@ func TestSortedMergeIterator_Cast_Float(t *testing.T) {
 				t.Errorf("iterator %d not closed", i)
 			}
 		case *IntegerIterator:
+			if !input.Closed {
+				t.Errorf("iterator %d not closed", i)
+			}
+		case *UnsignedIterator:
 			if !input.Closed {
 				t.Errorf("iterator %d not closed", i)
 			}
@@ -575,6 +673,35 @@ func TestLimitIterator_Integer(t *testing.T) {
 	} else if !deep.Equal(a, [][]query.Point{
 		{&query.IntegerPoint{Name: "cpu", Time: 5, Value: 3}},
 		{&query.IntegerPoint{Name: "mem", Time: 7, Value: 8}},
+	}) {
+		t.Fatalf("unexpected points: %s", spew.Sdump(a))
+	}
+
+	if !input.Closed {
+		t.Error("iterator not closed")
+	}
+}
+
+// Ensure limit iterators work with limit and offset.
+func TestLimitIterator_Unsigned(t *testing.T) {
+	input := &UnsignedIterator{Points: []query.UnsignedPoint{
+		{Name: "cpu", Time: 0, Value: 1},
+		{Name: "cpu", Time: 5, Value: 3},
+		{Name: "cpu", Time: 10, Value: 5},
+		{Name: "mem", Time: 5, Value: 3},
+		{Name: "mem", Time: 7, Value: 8},
+	}}
+
+	itr := query.NewLimitIterator(input, query.IteratorOptions{
+		Limit:  1,
+		Offset: 1,
+	})
+
+	if a, err := Iterators([]query.Iterator{itr}).ReadAll(); err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	} else if !deep.Equal(a, [][]query.Point{
+		{&query.UnsignedPoint{Name: "cpu", Time: 5, Value: 3}},
+		{&query.UnsignedPoint{Name: "mem", Time: 7, Value: 8}},
 	}) {
 		t.Fatalf("unexpected points: %s", spew.Sdump(a))
 	}
@@ -642,44 +769,6 @@ func TestLimitIterator_Boolean(t *testing.T) {
 	}
 }
 
-// Ensure auxilary iterators can be created for auxilary fields.
-func TestFloatAuxIterator(t *testing.T) {
-	itr := query.NewAuxIterator(
-		&FloatIterator{Points: []query.FloatPoint{
-			{Time: 0, Value: 1, Aux: []interface{}{float64(100), float64(200)}},
-			{Time: 1, Value: 2, Aux: []interface{}{float64(500), math.NaN()}},
-		}},
-		query.IteratorOptions{Aux: []influxql.VarRef{{Val: "f0", Type: influxql.Float}, {Val: "f1", Type: influxql.Float}}},
-	)
-
-	itrs := []query.Iterator{
-		itr,
-		itr.Iterator("f0", influxql.Unknown),
-		itr.Iterator("f1", influxql.Unknown),
-		itr.Iterator("f0", influxql.Unknown),
-	}
-	itr.Start()
-
-	if a, err := Iterators(itrs).ReadAll(); err != nil {
-		t.Fatalf("unexpected error: %s", err)
-	} else if !deep.Equal(a, [][]query.Point{
-		{
-			&query.FloatPoint{Time: 0, Value: 1, Aux: []interface{}{float64(100), float64(200)}},
-			&query.FloatPoint{Time: 0, Value: float64(100)},
-			&query.FloatPoint{Time: 0, Value: float64(200)},
-			&query.FloatPoint{Time: 0, Value: float64(100)},
-		},
-		{
-			&query.FloatPoint{Time: 1, Value: 2, Aux: []interface{}{float64(500), math.NaN()}},
-			&query.FloatPoint{Time: 1, Value: float64(500)},
-			&query.FloatPoint{Time: 1, Value: math.NaN()},
-			&query.FloatPoint{Time: 1, Value: float64(500)},
-		},
-	}) {
-		t.Fatalf("unexpected points: %s", spew.Sdump(a))
-	}
-}
-
 // Ensure limit iterator returns a subset of points.
 func TestLimitIterator(t *testing.T) {
 	itr := query.NewLimitIterator(
@@ -702,6 +791,35 @@ func TestLimitIterator(t *testing.T) {
 	} else if !deep.Equal(a, [][]query.Point{
 		{&query.FloatPoint{Time: 1, Value: 1}},
 		{&query.FloatPoint{Time: 2, Value: 2}},
+	}) {
+		t.Fatalf("unexpected points: %s", spew.Sdump(a))
+	}
+}
+
+func TestFillIterator_ImplicitStartTime(t *testing.T) {
+	opt := query.IteratorOptions{
+		StartTime: influxql.MinTime,
+		EndTime:   mustParseTime("2000-01-01T01:00:00Z").UnixNano() - 1,
+		Interval: query.Interval{
+			Duration: 20 * time.Minute,
+		},
+		Ascending: true,
+	}
+	start := mustParseTime("2000-01-01T00:00:00Z").UnixNano()
+	itr := query.NewFillIterator(
+		&FloatIterator{Points: []query.FloatPoint{
+			{Time: start, Value: 0},
+		}},
+		nil,
+		opt,
+	)
+
+	if a, err := (Iterators{itr}).ReadAll(); err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	} else if !deep.Equal(a, [][]query.Point{
+		{&query.FloatPoint{Time: start, Value: 0}},
+		{&query.FloatPoint{Time: start + int64(20*time.Minute), Nil: true}},
+		{&query.FloatPoint{Time: start + int64(40*time.Minute), Nil: true}},
 	}) {
 		t.Fatalf("unexpected points: %s", spew.Sdump(a))
 	}
@@ -949,6 +1067,12 @@ func (itrs Iterators) Next() ([]query.Point, error) {
 				return nil, err
 			}
 			a[i] = ip
+		case query.UnsignedIterator:
+			up, err := itr.Next()
+			if up == nil || err != nil {
+				return nil, err
+			}
+			a[i] = up
 		case query.StringIterator:
 			sp, err := itr.Next()
 			if sp == nil || err != nil {
@@ -1305,18 +1429,23 @@ func TestIteratorOptions_MarshalBinary(t *testing.T) {
 			Offset:   20 * time.Minute,
 		},
 		Dimensions: []string{"region", "host"},
-		Fill:       influxql.NumberFill,
-		FillValue:  float64(100),
-		Condition:  MustParseExpr(`foo = 'bar'`),
-		StartTime:  1000,
-		EndTime:    2000,
-		Ascending:  true,
-		Limit:      100,
-		Offset:     200,
-		SLimit:     300,
-		SOffset:    400,
-		StripName:  true,
-		Dedupe:     true,
+		GroupBy: map[string]struct{}{
+			"region":  {},
+			"host":    {},
+			"cluster": {},
+		},
+		Fill:      influxql.NumberFill,
+		FillValue: float64(100),
+		Condition: MustParseExpr(`foo = 'bar'`),
+		StartTime: 1000,
+		EndTime:   2000,
+		Ascending: true,
+		Limit:     100,
+		Offset:    200,
+		SLimit:    300,
+		SOffset:   400,
+		StripName: true,
+		Dedupe:    true,
 	}
 
 	// Marshal to binary.
@@ -1358,7 +1487,7 @@ func TestIterator_EncodeDecode(t *testing.T) {
 	}
 
 	// Decode from the buffer.
-	dec := query.NewReaderIterator(&buf, influxql.Float, itr.Stats())
+	dec := query.NewReaderIterator(context.Background(), &buf, influxql.Float, itr.Stats())
 
 	// Initial stats should exist immediately.
 	fdec := dec.(query.FloatIterator)
@@ -1384,40 +1513,14 @@ func TestIterator_EncodeDecode(t *testing.T) {
 	}
 }
 
-// IteratorCreator is a mockable implementation of SelectStatementExecutor.IteratorCreator.
-type IteratorCreator struct {
-	CreateIteratorFn  func(m *influxql.Measurement, opt query.IteratorOptions) (query.Iterator, error)
-	FieldDimensionsFn func(m *influxql.Measurement) (fields map[string]influxql.DataType, dimensions map[string]struct{}, err error)
-}
-
-func (ic *IteratorCreator) CreateIterator(m *influxql.Measurement, opt query.IteratorOptions) (query.Iterator, error) {
-	return ic.CreateIteratorFn(m, opt)
-}
-
-func (ic *IteratorCreator) FieldDimensions(m *influxql.Measurement) (fields map[string]influxql.DataType, dimensions map[string]struct{}, err error) {
-	return ic.FieldDimensionsFn(m)
-}
-
-func (ic *IteratorCreator) MapType(m *influxql.Measurement, field string) influxql.DataType {
-	f, d, err := ic.FieldDimensions(m)
-	if err != nil {
-		return influxql.Unknown
-	}
-
-	if typ, ok := f[field]; ok {
-		return typ
-	}
-	if _, ok := d[field]; ok {
-		return influxql.Tag
-	}
-	return influxql.Unknown
-}
-
 // Test implementation of influxql.FloatIterator
 type FloatIterator struct {
-	Points []query.FloatPoint
-	Closed bool
-	stats  query.IteratorStats
+	Context context.Context
+	Points  []query.FloatPoint
+	Closed  bool
+	Delay   time.Duration
+	stats   query.IteratorStats
+	point   query.FloatPoint
 }
 
 func (itr *FloatIterator) Stats() query.IteratorStats { return itr.stats }
@@ -1429,9 +1532,38 @@ func (itr *FloatIterator) Next() (*query.FloatPoint, error) {
 		return nil, nil
 	}
 
+	// If we have asked for a delay, then delay the returning of the point
+	// until either an (optional) context is done or the time has passed.
+	if itr.Delay > 0 {
+		var done <-chan struct{}
+		if itr.Context != nil {
+			done = itr.Context.Done()
+		}
+
+		timer := time.NewTimer(itr.Delay)
+		select {
+		case <-timer.C:
+		case <-done:
+			timer.Stop()
+			return nil, itr.Context.Err()
+		}
+	}
 	v := &itr.Points[0]
 	itr.Points = itr.Points[1:]
-	return v, nil
+
+	// Copy the returned point into a static point that we return.
+	// This actual storage engine returns a point from the same memory location
+	// so we need to test that the query engine does not misuse this memory.
+	itr.point.Name = v.Name
+	itr.point.Tags = v.Tags
+	itr.point.Time = v.Time
+	itr.point.Value = v.Value
+	itr.point.Nil = v.Nil
+	if len(itr.point.Aux) != len(v.Aux) {
+		itr.point.Aux = make([]interface{}, len(v.Aux))
+	}
+	copy(itr.point.Aux, v.Aux)
+	return &itr.point, nil
 }
 
 func FloatIterators(inputs []*FloatIterator) []query.Iterator {
@@ -1447,6 +1579,7 @@ type IntegerIterator struct {
 	Points []query.IntegerPoint
 	Closed bool
 	stats  query.IteratorStats
+	point  query.IntegerPoint
 }
 
 func (itr *IntegerIterator) Stats() query.IteratorStats { return itr.stats }
@@ -1460,10 +1593,66 @@ func (itr *IntegerIterator) Next() (*query.IntegerPoint, error) {
 
 	v := &itr.Points[0]
 	itr.Points = itr.Points[1:]
-	return v, nil
+
+	// Copy the returned point into a static point that we return.
+	// This actual storage engine returns a point from the same memory location
+	// so we need to test that the query engine does not misuse this memory.
+	itr.point.Name = v.Name
+	itr.point.Tags = v.Tags
+	itr.point.Time = v.Time
+	itr.point.Value = v.Value
+	itr.point.Nil = v.Nil
+	if len(itr.point.Aux) != len(v.Aux) {
+		itr.point.Aux = make([]interface{}, len(v.Aux))
+	}
+	copy(itr.point.Aux, v.Aux)
+	return &itr.point, nil
 }
 
 func IntegerIterators(inputs []*IntegerIterator) []query.Iterator {
+	itrs := make([]query.Iterator, len(inputs))
+	for i := range itrs {
+		itrs[i] = query.Iterator(inputs[i])
+	}
+	return itrs
+}
+
+// Test implementation of query.UnsignedIterator
+type UnsignedIterator struct {
+	Points []query.UnsignedPoint
+	Closed bool
+	stats  query.IteratorStats
+	point  query.UnsignedPoint
+}
+
+func (itr *UnsignedIterator) Stats() query.IteratorStats { return itr.stats }
+func (itr *UnsignedIterator) Close() error               { itr.Closed = true; return nil }
+
+// Next returns the next value and shifts it off the beginning of the points slice.
+func (itr *UnsignedIterator) Next() (*query.UnsignedPoint, error) {
+	if len(itr.Points) == 0 || itr.Closed {
+		return nil, nil
+	}
+
+	v := &itr.Points[0]
+	itr.Points = itr.Points[1:]
+
+	// Copy the returned point into a static point that we return.
+	// This actual storage engine returns a point from the same memory location
+	// so we need to test that the query engine does not misuse this memory.
+	itr.point.Name = v.Name
+	itr.point.Tags = v.Tags
+	itr.point.Time = v.Time
+	itr.point.Value = v.Value
+	itr.point.Nil = v.Nil
+	if len(itr.point.Aux) != len(v.Aux) {
+		itr.point.Aux = make([]interface{}, len(v.Aux))
+	}
+	copy(itr.point.Aux, v.Aux)
+	return &itr.point, nil
+}
+
+func UnsignedIterators(inputs []*UnsignedIterator) []query.Iterator {
 	itrs := make([]query.Iterator, len(inputs))
 	for i := range itrs {
 		itrs[i] = query.Iterator(inputs[i])
@@ -1476,6 +1665,7 @@ type StringIterator struct {
 	Points []query.StringPoint
 	Closed bool
 	stats  query.IteratorStats
+	point  query.StringPoint
 }
 
 func (itr *StringIterator) Stats() query.IteratorStats { return itr.stats }
@@ -1489,7 +1679,20 @@ func (itr *StringIterator) Next() (*query.StringPoint, error) {
 
 	v := &itr.Points[0]
 	itr.Points = itr.Points[1:]
-	return v, nil
+
+	// Copy the returned point into a static point that we return.
+	// This actual storage engine returns a point from the same memory location
+	// so we need to test that the query engine does not misuse this memory.
+	itr.point.Name = v.Name
+	itr.point.Tags = v.Tags
+	itr.point.Time = v.Time
+	itr.point.Value = v.Value
+	itr.point.Nil = v.Nil
+	if len(itr.point.Aux) != len(v.Aux) {
+		itr.point.Aux = make([]interface{}, len(v.Aux))
+	}
+	copy(itr.point.Aux, v.Aux)
+	return &itr.point, nil
 }
 
 func StringIterators(inputs []*StringIterator) []query.Iterator {
@@ -1505,6 +1708,7 @@ type BooleanIterator struct {
 	Points []query.BooleanPoint
 	Closed bool
 	stats  query.IteratorStats
+	point  query.BooleanPoint
 }
 
 func (itr *BooleanIterator) Stats() query.IteratorStats { return itr.stats }
@@ -1518,7 +1722,20 @@ func (itr *BooleanIterator) Next() (*query.BooleanPoint, error) {
 
 	v := &itr.Points[0]
 	itr.Points = itr.Points[1:]
-	return v, nil
+
+	// Copy the returned point into a static point that we return.
+	// This actual storage engine returns a point from the same memory location
+	// so we need to test that the query engine does not misuse this memory.
+	itr.point.Name = v.Name
+	itr.point.Tags = v.Tags
+	itr.point.Time = v.Time
+	itr.point.Value = v.Value
+	itr.point.Nil = v.Nil
+	if len(itr.point.Aux) != len(v.Aux) {
+		itr.point.Aux = make([]interface{}, len(v.Aux))
+	}
+	copy(itr.point.Aux, v.Aux)
+	return &itr.point, nil
 }
 
 func BooleanIterators(inputs []*BooleanIterator) []query.Iterator {
